@@ -1,0 +1,19 @@
+# Generation protocol -- identical for every clip of a model (proposal: "specific generation
+# settings ... have to be defined and kept consistent for the same model").
+#
+# OPEN DECISIONS (defaults below are placeholders, not decisions; see docs/DECISIONS.md):
+#   * prompt: must not mention the intervened factor (color, background, camera) or the
+#     future; one fixed, scene-neutral text for all 18 clips.
+#   * samples_per_clip: >= 2 lets the analysis separate the intervention effect from
+#     sampling randomness (seed floor). Cost scales linearly.
+
+prompt: "Continue this video. The camera stays still."
+negative_prompt: "camera motion, zoom, cut, new objects, text"
+duration_s: 4.0            # continuation to keep (96 frames at 24 fps)
+samples_per_clip: 3
+base_seed: 1234            # sample k uses seed base_seed + k where the API accepts seeds
+
+budget_usd: 60.0           # hard stop: a run never starts jobs whose estimate exceeds this
+max_retries: 2
+poll_interval_s: 10
+timeout_s: 1800

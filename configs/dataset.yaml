@@ -1,0 +1,6 @@
+# Where the benchmark clips live. Point `manifest` at the Kubric dataset's manifest.json
+# (build it with `python -m fairbench import-kubric`, or write it by hand: docs/DATA_FORMAT.md).
+manifest: data/fairbench_v1/manifest.json
+
+# Runs (generated videos, tracks, scores) go under this folder: runs/<run name>/...
+runs_dir: runs

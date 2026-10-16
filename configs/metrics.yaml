@@ -1,0 +1,42 @@
+# Metric settings. Values marked DECIDED come from the proposal; OPEN ones are defaults
+# that keep the pipeline running until the choice is made (docs/DECISIONS.md).
+
+tracking:
+  tracker: sam2                     # DECIDED: SAM 2.1 + sub-pixel refinement ('color' = fast, synthetic only)
+  sam2:
+    checkpoint: checkpoints/sam2.1_hiera_large.pt
+    config: configs/sam2.1/sam2.1_hiera_l.yaml
+  color: {}
+
+median_k: 5                         # DECIDED: 5-frame running median (removes 1-2 frame glitches)
+noise_px: 0.3                       # DECIDED: tracker-noise level that defines E_ceil
+calibration_mc: 50                  # Monte-Carlo draws for the noise floors
+visible_full: 0.99                  # frames where the GT ball is >= 99% visible are compared
+jump_thresh_radii: 3.0              # single-frame jumps larger than 3 ball radii are removed
+camera_motion_px: 2.0               # background motion above this flags the video ("camera moved")
+
+missing_policy: penalty             # OPEN: penalty (a lost frame costs 10 one-frame lags) | exclude
+
+dynamical_methods: [lsq, pinn]      # both are computed; plausibility.method picks the primary
+plausibility:
+  method: pinn                      # OPEN: pinn (Morpheus, soft constraint) | lsq (exact physics fit)
+  combine: mean                     # OPEN: mean(S_dyn, S_inv) | dyn_only | product
+  pinn_epochs: 20000
+  pinn_lr: 0.001
+  pinn_hidden: 20
+  pinn_lambda: 1.0
+  pinn_patience: 1000
+  contact_tol_m: 0.03
+  min_segment_frames: 4
+  window_frac: 0.25                 # Morpheus: windows of 1/4 of the trajectory
+  invariance_reduce: max            # Morpheus: best window per invariant
+  discard_lost_frac: 0.2
+  discard_multi_frac: 0.1
+  discard_still_frac: 0.1
+  energy_gain_tol: 0.10
+
+bootstrap: 200                      # resamples for 95% intervals (needs >= 2 samples per clip)
+bootstrap_seed: 0
+
+baseline_noise_px: 0.3              # tracker-like noise added to baseline tracks
+baseline_samples: 1

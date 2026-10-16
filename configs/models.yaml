@@ -1,0 +1,214 @@
+# V2V candidates from the proposal's "Appendix: Models & Cost" (prices and provider notes as
+# written there, early Oct 2026 -- re-check before running). Nothing is enabled: choosing the
+# model list is an open decision. To add a model:
+#   1. pick its provider; copy the endpoint id and argument names from the provider's API page
+#      into `endpoint` / `arguments` (fal), `model_ref` / `input` (Replicate) or `submit` / `poll` (http)
+#   2. set enabled: true (or pass --models NAME)
+#   3. `python -m fairbench plan` -> `generate --dry-run` -> `generate --clips thrown_color_r --samples 1`
+#      (one clip first: check the output in runs/<run>/<model>/) -> full run
+#
+# Constraint fields the runner checks before spending money:
+#   conditioning_window_s  how much of the end of the input the model sees. Every ballistic
+#                          scene needs the window to include the last floor contact in the
+#                          input (1.56 s), i.e. >= 0.52 s (computed from the manifest).
+#   min_input_frames       models that reject a 48-frame (2 s) input.
+#   supports_seed          false = repeated calls are the samples (no seed sent).
+# align.includes_input: auto | true | false  -- whether the API returns input + continuation.
+# align.repeats_last_input: true for an API whose continuation starts with a copy of the last
+#   input frame (never auto-detected: a lagging model looks the same; check the first outputs).
+
+defaults:
+  enabled: false
+  max_concurrency: 2
+  supports_seed: true
+  align: {includes_input: auto, repeats_last_input: false}
+
+models:
+  # ------------------------------------------------------------------- mocks (free, offline)
+  mock-oracle:
+    adapter: mock
+    mode: oracle
+    notes: reference continuation; every score should be near 1
+  mock-oracle-api-quirks:
+    adapter: mock
+    mode: oracle
+    emulate: {includes_input: true, fps: 16, size: [960, 540]}
+    notes: same as oracle but returned like a different API (input replayed, 16 fps, 960x540)
+  mock-freeze:
+    adapter: mock
+    mode: freeze
+    notes: last input frame repeated; perfectly robust, physically wrong
+  mock-lag-variant2:
+    adapter: mock
+    mode: lag
+    lag: 0
+    lag_by_variant: {"2": 1}
+    notes: variant 2 one frame late; VIMS should be about e^-1
+  mock-timewarp-blue:
+    adapter: mock
+    mode: timewarp
+    factor_by_variant: {"b": 1.08}
+    notes: blue ball moves 8% faster; color groups lose robustness
+  mock-noise:
+    adapter: mock
+    mode: noise
+    sigma: 6.0
+    jitter_px: 0.15
+    notes: pixel noise + sub-pixel shake; tests tracker robustness and the seed floor
+
+  # --------------------------------------------------------------------- real candidates
+  grok-imagine-video:
+    adapter: fal
+    endpoint: null
+    endpoint_hint: "xAI official; fal (input 2-15 s); Replicate ($0.05/s); WaveSpeed (6/10 s outputs only); Atlas [unverified]"
+    cost_per_generation_usd: 0.30   # xAI: $0.07/s x 4 + input $0.01/s x 2
+    arguments: {video_url: "{video_url}", prompt: "{prompt}", seed: "{seed}"}   # VERIFY names on the model page
+    output_path: video.url
+
+  gemini-omni-1.1-flash:
+    adapter: http
+    api_key_env: GEMINI_API_KEY
+    endpoint_hint: "Gemini API (input <= 10 s; not in EEA/UK/CH); Vertex [preview] (input 1-30 s); AIML ($0.13/s); Atlas; EvoLink; Kie"
+    cost_per_generation_usd: 0.42   # ~$0.10/s x 4 + input ~$0.009/s x 2; audio always on
+    submit: {url: null}
+    poll: {url: null}
+
+  seedance-2.5:
+    adapter: http
+    api_key_env: BYTEPLUS_API_KEY
+    endpoint_hint: "BytePlus official (extend mode); Volcengine (CN); WaveSpeed ($1.32); EvoLink ($1.08); PiAPI; Runway ($1.50); fal/Replicate/OpenRouter/Kie/Segmind (reference-video route)"
+    cost_per_generation_usd: 0.97   # BytePlus; minimum-token rule applies
+    submit: {url: null}
+    poll: {url: null}
+  seedance-2.0:
+    adapter: http
+    api_key_env: BYTEPLUS_API_KEY
+    endpoint_hint: "BytePlus; Volcengine; fal/Replicate/OpenRouter/Kie/Segmind/EvoLink/PiAPI (reference-video route); WaveSpeed extend NOT usable (last frame only)"
+    cost_per_generation_usd: 0.65
+    submit: {url: null}
+    poll: {url: null}
+  seedance-2.0-fast:
+    adapter: http
+    api_key_env: BYTEPLUS_API_KEY
+    endpoint_hint: "same as Seedance 2.0; Segmind cheapest (~$0.21)"
+    cost_per_generation_usd: 0.50   # BytePlus list price (the $0.37 promo ended 10/7)
+    submit: {url: null}
+    poll: {url: null}
+  seedance-2.0-mini:
+    adapter: http
+    api_key_env: BYTEPLUS_API_KEY
+    endpoint_hint: "same as Seedance 2.0; Segmind cheapest (~$0.14)"
+    cost_per_generation_usd: 0.32   # BytePlus list price (the $0.13 promo ended 10/7)
+    submit: {url: null}
+    poll: {url: null}
+
+  minimax-h3-max:
+    adapter: fal
+    endpoint: null
+    endpoint_hint: "fal extend-video only (input 1.6-60 s)"
+    cost_per_generation_usd: 0.40   # fal: $0.08/s, 5 s minimum
+    arguments: {video_url: "{video_url}", prompt: "{prompt}"}   # VERIFY
+    output_path: video.url
+
+  wan-3.0:
+    adapter: http
+    api_key_env: DASHSCOPE_API_KEY
+    endpoint_hint: "Alibaba Model Studio (prompt-driven extend); WaveSpeed extend ($0.40, only new frames billed)"
+    cost_per_generation_usd: 0.60   # Alibaba bills input + output, $0.10/s x 6
+    submit: {url: null}
+    poll: {url: null}
+  wan-2.7:
+    adapter: fal
+    endpoint: null
+    endpoint_hint: "Alibaba (first-clip continuation mode); fal; Replicate; Atlas; Novita; WaveSpeed extend"
+    cost_per_generation_usd: 0.60   # Alibaba: billed on total length incl. input
+    arguments: {video_url: "{video_url}", prompt: "{prompt}", seed: "{seed}"}   # VERIFY
+    output_path: video.url
+  wan-2.6:
+    adapter: http
+    endpoint_hint: "WaveSpeed extend only [backend unclear]"
+    cost_per_generation_usd: 0.50   # 5 s minimum
+    submit: {url: null}
+    poll: {url: null}
+  wan-2.5:
+    adapter: http
+    endpoint_hint: "WaveSpeed extend only [backend unclear]"
+    cost_per_generation_usd: 0.40
+    submit: {url: null}
+    poll: {url: null}
+
+  ltx-2.3:
+    adapter: fal
+    endpoint: null
+    endpoint_hint: "fal ltx-2.3-22b/extend (context 0-121 frames); fal ltx-2.3-quality/extend (~$0.053/s); WaveSpeed ($0.10/s)"
+    cost_per_generation_usd: 0.14   # ~$0.036/s; +~$0.07 if the input context is billed
+    arguments: {video_url: "{video_url}", prompt: "{prompt}", seed: "{seed}"}   # VERIFY
+    output_path: video.url
+    notes: open weights (22B)
+  ltx-2.3-pro:
+    adapter: fal
+    endpoint: null
+    endpoint_hint: "LTX API v1 [ends 10/26] / v2; fal; Replicate"
+    min_input_frames: 73
+    notes: rejects a 2 s input (needs >= 73 frames) -- not usable as specified
+
+  skyreels-v3-v2v:
+    adapter: http
+    endpoint_hint: "APIFree (Skywork's official channel; input-length limit not documented); WaveSpeed [likely delisted]"
+    cost_per_generation_usd: 0.20   # $0.04/s, 5 s minimum
+    submit: {url: null}
+    poll: {url: null}
+    notes: 14B
+
+  magi-1-distilled:
+    adapter: fal
+    endpoint: null
+    endpoint_hint: "fal magi-distilled/extend (conditions on the whole prefix); Sand AI official [~$0.10/s, unverified]"
+    cost_per_generation_usd: 0.32   # fal: 96-frame minimum
+    arguments: {video_url: "{video_url}", prompt: "{prompt}", seed: "{seed}"}   # VERIFY
+    output_path: video.url
+
+  cosmos-3-nano:
+    adapter: http
+    endpoint_hint: "NVIDIA build free trial (can condition on the last frames)"
+    cost_per_generation_usd: 0.0
+    conditioning_window_s: 0.2083   # max 5 input frames -> misses the last bounce: future not determined
+    submit: {url: null}
+    poll: {url: null}
+  cosmos-3-super:
+    adapter: http
+    endpoint_hint: "DeepInfra only [ended 10/2-3]; no V2V option after 10/6"
+    cost_per_generation_usd: 0.20
+    available: false
+    submit: {url: null}
+    poll: {url: null}
+  cosmos-predict2.5-2b:
+    adapter: fal
+    endpoint: null
+    endpoint_hint: "fal (number of conditioning frames not documented); WaveSpeed V2V [page broken]"
+    cost_per_generation_usd: 0.20   # per video, fixed 5.8 s output
+    arguments: {video_url: "{video_url}", prompt: "{prompt}", seed: "{seed}"}   # VERIFY
+    output_path: video.url
+    notes: check how many input frames it conditions on before trusting its scores
+
+  veo-3.1:
+    adapter: http
+    endpoint_hint: "Vertex (input 1-30 s at 24 fps; arbitrary videos [unverified]; continues from the last 1 s of the input); fal / AIML extend (probably Vertex underneath); Gemini API / WaveSpeed / EachLabs accept Veo-generated videos only"
+    cost_per_generation_usd: 1.40   # Vertex; extend output fixed at 7 s
+    conditioning_window_s: 1.0
+    submit: {url: null}
+    poll: {url: null}
+  veo-3.1-fast:
+    adapter: http
+    endpoint_hint: "as Veo 3.1"
+    cost_per_generation_usd: 0.56
+    conditioning_window_s: 1.0
+    submit: {url: null}
+    poll: {url: null}
+  veo-3.1-lite:
+    adapter: http
+    endpoint_hint: "as Veo 3.1"
+    cost_per_generation_usd: 0.21
+    conditioning_window_s: 1.0
+    submit: {url: null}
+    poll: {url: null}
