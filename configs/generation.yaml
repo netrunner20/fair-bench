@@ -14,6 +14,7 @@ samples_per_clip: 3
 base_seed: 1234            # sample k uses seed base_seed + k where the API accepts seeds
 
 budget_usd: 60.0           # hard stop: a run never starts jobs whose estimate exceeds this
-max_retries: 2
+max_retries: 2              # submissions after a provider-reported failure; poll errors never resubmit
+retry_backoff_s: 2.0
 poll_interval_s: 10
 timeout_s: 1800

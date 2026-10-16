@@ -40,7 +40,8 @@ def _now() -> str:
 
 def git_commit() -> str | None:
     try:
-        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+        # "-dirty" marks outputs made with uncommitted harness changes
+        return subprocess.run(["git", "describe", "--always", "--dirty", "--abbrev=7"], capture_output=True, text=True,
                               cwd=Path(__file__).parent, check=True).stdout.strip()
     except Exception:
         return None
@@ -196,44 +197,70 @@ def run_jobs(ds: Dataset, run_dir: Path, jobs: list[Job], models: dict[str, dict
         ad = adapters[job.model]
         t0 = time.time()
         tries = int(gen.get("max_retries", 2)) + 1
+        backoff = float(gen.get("retry_backoff_s", 2.0))
+        job_id = pending.get(job.key)
+        if job_id is not None:
+            log(f"  resuming {job.key} (job {job_id})")
         last_err = None
-        for attempt in range(tries):
-            try:
-                job_id = pending.get(job.key)
-                if job_id is None:
+        submits = 0
+        poll_errors = 0
+        while True:
+            # 1. submit -- the only step that costs money; never repeated while a job id is alive
+            if job_id is None:
+                if submits >= tries:
+                    break
+                try:
+                    submits += 1
                     job_id = ad.submit(req)
-                    journal.write(event="submitted", job=job.key, job_id=job_id, attempt=attempt)
-                else:
-                    log(f"  resuming {job.key} (job {job_id})")
+                    journal.write(event="submitted", job=job.key, job_id=job_id, attempt=submits)
+                except Exception as e:  # noqa: BLE001 - nothing was created (or the API gave no id)
+                    last_err = e
+                    journal.write(event="submit_error", job=job.key, attempt=submits, error=repr(e),
+                                  trace=traceback.format_exc(limit=3))
+                    time.sleep(min(60.0, backoff * 2 ** submits))
+                    continue
+            # 2. poll + fetch -- errors here (network, rate limits) keep the job id and retry
+            try:
                 deadline = time.time() + float(gen.get("timeout_s", 1800))
                 while True:
                     st = ad.poll(job_id)
-                    if st.state == "done":
+                    if st.state in ("done", "failed"):
                         break
-                    if st.state == "failed":
-                        raise RuntimeError(st.error or "provider reported failure")
                     if time.time() > deadline:
-                        raise TimeoutError(f"no result after {gen.get('timeout_s', 1800)} s")
+                        # leave it pending in the journal: the next run re-polls instead of paying again
+                        log(f"  TIMEOUT {job.key}: job {job_id} still running; re-run later to collect it")
+                        return False
                     time.sleep(float(gen.get("poll_interval_s", 10)))
+                if st.state == "failed":
+                    # the provider says the job failed: a new submission is legitimate
+                    last_err = RuntimeError(st.error or "provider reported failure")
+                    journal.write(event="failed", job=job.key, job_id=job_id, error=str(st.error)[:500])
+                    job_id = None
+                    continue
                 path = ad.fetch(st, req)
-                sidecar = {
-                    "job": job.key, "job_id": job_id, "request": req.to_dict(), "model": ad.describe(),
-                    "provider_meta": st.meta, "harness_commit": git_commit(), "started": t0,
-                    "seconds": round(time.time() - t0, 1), "cost_usd_estimate": job.cost_usd, "finished": _now(),
-                }
-                if m.get("adapter") == "mock":
-                    sidecar["request"].pop("params", None)  # mocks read the reference; keep it out of the record
-                path.with_suffix(".json").write_text(json.dumps(sidecar, indent=2, default=str))
-                journal.write(event="finished", job=job.key, job_id=job_id)
-                with ledger_lock, open(run_dir / "ledger.jsonl", "a") as f:
-                    f.write(json.dumps({"job": job.key, "cost_usd": job.cost_usd, "time": _now()}) + "\n")
-                return True
-            except Exception as e:  # retry with backoff
+            except Exception as e:  # noqa: BLE001
                 last_err = e
-                pending.pop(job.key, None)
-                journal.write(event="failed", job=job.key, attempt=attempt, error=repr(e),
+                poll_errors += 1
+                journal.write(event="poll_error", job=job.key, job_id=job_id, error=repr(e),
                               trace=traceback.format_exc(limit=3))
-                time.sleep(min(60, 2 ** attempt))
+                if poll_errors > tries:
+                    log(f"  GAVE UP polling {job.key} (job {job_id} stays pending for the next run): {e!r}")
+                    return False
+                time.sleep(min(60.0, backoff * 2 ** poll_errors))
+                continue
+            sidecar = {
+                "job": job.key, "job_id": job_id, "request": req.to_dict(), "model": ad.describe(),
+                "provider_meta": st.meta, "harness_commit": git_commit(), "started": t0,
+                "seconds": round(time.time() - t0, 1), "cost_usd_estimate": job.cost_usd, "finished": _now(),
+                "submissions": submits,
+            }
+            if m.get("adapter") == "mock":
+                sidecar["request"].pop("params", None)  # mocks read the reference; keep it out of the record
+            path.with_suffix(".json").write_text(json.dumps(sidecar, indent=2, default=str))
+            journal.write(event="finished", job=job.key, job_id=job_id)
+            with ledger_lock, open(run_dir / "ledger.jsonl", "a") as f:
+                f.write(json.dumps({"job": job.key, "cost_usd": job.cost_usd * max(submits, 1), "time": _now()}) + "\n")
+            return True
         log(f"  FAILED {job.key}: {last_err!r}")
         return False
 

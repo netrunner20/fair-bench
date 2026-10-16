@@ -149,7 +149,7 @@ def cmd_score(args, cfg):
         if not tracks:
             sys.exit(f"no videos under {run_dir / args.model}")
         out = run_dir / args.model / "scores"
-    gen, grp, summary = score_tracks(ds, tracks, cal, mcfg, methods=methods)
+    gen, grp, summary = score_tracks(ds, tracks, cal, mcfg, methods=methods, workers=args.workers)
     write_scores(out, gen, grp, summary, {"model": args.model, "calibration": cal["groups"],
                                           "metrics_config_hash": config_hash(mcfg)})
     if args.plots:
@@ -181,7 +181,7 @@ def cmd_report(args, cfg):
 def cmd_sanity(args, cfg):
     from .sanity import run_sanity
 
-    run_sanity(resolve(args.out), res=args.res, quick=args.quick)
+    run_sanity(resolve(args.out), res=args.res, quick=args.quick, workers=args.workers)
 
 
 def main(argv=None):
@@ -226,6 +226,8 @@ def main(argv=None):
             s.add_argument("--model", required=True, help="model name, or baseline:<name>")
             s.add_argument("--tracker", default=None)
             s.add_argument("--methods", default=None, help="dynamical-score methods, e.g. lsq or lsq,pinn")
+            s.add_argument("--workers", type=int, default=None,
+                           help="processes for the plausibility fits (PINN); default: metrics.yaml 'workers'")
             s.add_argument("--retrack", action="store_true")
             s.add_argument("--plots", action="store_true")
         if name == "report":
@@ -236,6 +238,7 @@ def main(argv=None):
     s.add_argument("--out", default="runs/sanity")
     s.add_argument("--res", default="320x180")
     s.add_argument("--quick", action="store_true")
+    s.add_argument("--workers", type=int, default=1, help="processes for the PINN check")
     s.set_defaults(fn=cmd_sanity)
 
     args = ap.parse_args(argv)

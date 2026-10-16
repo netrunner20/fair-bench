@@ -37,6 +37,8 @@ plausibility:
 
 bootstrap: 200                      # resamples for 95% intervals (needs >= 2 samples per clip)
 bootstrap_seed: 0
+workers: 1                          # processes for the PINN fits (~40-60 s per generation per process
+                                    # at 20000 epochs); set to the number of CPU cores
 
 baseline_noise_px: 0.3              # tracker-like noise added to baseline tracks
 baseline_samples: 1

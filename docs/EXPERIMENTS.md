@@ -6,14 +6,16 @@
 pip install -e ".[pinn,api,dev]"                      # numpy, opencv, torch (PINN), fal/replicate clients, pytest
 pip install "git+https://github.com/facebookresearch/sam2.git"
 # SAM 2.1 checkpoint (e.g. sam2.1_hiera_large.pt) -> checkpoints/  (path set in configs/metrics.yaml)
-pytest                                                # 20 tests, ~10 s
-python -m fairbench sanity                            # end-to-end on synthetic data, ~5-15 min on CPU
+pytest                                                # 37 tests, ~30 s
+python -m fairbench sanity                            # end-to-end on synthetic data, ~5-10 min on CPU
 ```
 
 `sanity` renders a small synthetic copy of the 18-clip design, runs the mock models
 (oracle, freeze, one-frame lag on variant 2, faster blue ball, API quirks, noise) and the
 baselines through generation -> tracking -> scoring -> report, then prints PASS/FAIL for
-the outcomes each one must produce. Run it after any change to the metric code.
+the outcomes each one must produce (including: the PINN reaches the exact least-squares
+dynamical score on the oracle, and no static-camera video is flagged as moving). Run it
+after any change to the metric code.
 
 ## 1. Point the harness at the Kubric dataset
 
@@ -46,9 +48,14 @@ known constraints. For the one you want:
    `input`. Anything else: the `http` adapter's `submit` / `poll` blocks
    (`fairbench/models/http.py` explains each field).
 3. Export the key named in `api_key_env` (`FAL_KEY` for fal, `REPLICATE_API_TOKEN` for Replicate).
-4. If the provider returns input + continuation, `align.includes_input: auto` handles it.
+4. If the provider returns input + continuation, `align.includes_input: auto` handles it
+   (also at another frame rate, and when the API keeps only the last part of the input).
    If its continuation starts with a copy of the last input frame, set
-   `align.repeats_last_input: true` (this is never guessed; see `align.py`).
+   `align.repeats_last_input: true` (this is never guessed; see `align.py`). After the
+   first video, check its `.track.json`: `align` records what was detected
+   (`includes_input`, `replay_starts_at_input_frame`, `first_frame_matches_last_input`,
+   `replay_clock_mismatch_frames` -- non-zero means the file's frame rate is not the
+   rate the frames were made at).
 
 ## 3. Generate (cheap first)
 
@@ -70,7 +77,7 @@ python -m fairbench generate --models ltx-2.3                 # all 18 clips x s
 ## 4. Score and compare
 
 ```bash
-python -m fairbench score --model ltx-2.3 --plots
+python -m fairbench score --model ltx-2.3 --plots --workers 8   # PINN fits in 8 processes
 for b in oracle freeze constant_velocity physics_from_input; do
   python -m fairbench score --model baseline:$b
 done
@@ -78,10 +85,17 @@ python -m fairbench report --models ltx-2.3 <other models> baseline:oracle basel
     baseline:constant_velocity baseline:physics_from_input
 ```
 
+Scoring time is dominated by the PINN (20000 epochs, all flights of a video fitted
+together): about 40-60 s per video per CPU core, so ~45 min for 54 videos on one core.
+`--workers` spreads the videos over processes; `--methods lsq` skips the PINN for a
+quick look (the exact least-squares fit is always computed too).
+
 Outputs:
 
 * `runs/<run>/<model>/scores/per_generation.csv`: one row per video (reference error,
-  plausibility parts, discard reason, lost-ball share, camera-moved flag, ...).
+  plausibility parts, discard reason, lost-ball share, camera-moved flag, ...). The
+  camera check needs background texture; on plain walls it reports "unknown"
+  (`camera_motion_px` empty) rather than guessing.
 * `.../per_group.csv`: robustness per group (raw mm, 0-1, 95% interval, seed floor).
 * `.../summary.json`, and `plots/` with tracked paths per group and VIMS error over time.
 * `runs/<run>/report/report.md` + CSVs + figures: all models side by side, every

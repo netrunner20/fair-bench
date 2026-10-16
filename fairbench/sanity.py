@@ -1,11 +1,14 @@
 """End-to-end check on synthetic data: every stage runs and every score lands where it must.
 
-    python -m fairbench sanity            # ~3-6 min on a laptop CPU
-    python -m fairbench sanity --quick    # fewer models, LSQ only
+    python -m fairbench sanity            # ~5-10 min on a laptop CPU (320x180)
+    python -m fairbench sanity --quick    # fewer models, no PINN
 
 Expected outcomes (asserted at the end, printed as PASS/FAIL):
-  oracle (video)            R, P, F near 1
-  oracle with API quirks    same as oracle (alignment handles fps, size, replayed input)
+  oracle (video)            R, P, F near 1; the PINN reaches the LSQ dynamical score
+  oracle with API quirks    R as for the oracle (alignment handles fps, size, replayed
+                            input); F a little lower, because the mock makes its 16 fps
+                            frames by picking the nearest 24 fps frame (up to 1/48 s off)
+  static cameras            no video flagged as "camera moved" (plain walls: "unknown")
   freeze                    R near 1 but P = 0 (discarded: never moves)
   lag on variant 2          angle group VIMS about e^-1; bg group drops; color groups unaffected
   timewarp on blue          color groups drop; bg and angle groups unaffected
@@ -31,15 +34,15 @@ from .tracking.color import ColorTracker
 from .validate import reference_floor
 
 
-def run_sanity(out: Path, res: str = "320x180", quick: bool = False) -> dict:
+def run_sanity(out: Path, res: str = "320x180", quick: bool = False, workers: int = 1) -> dict:
     t0 = time.time()
     out = Path(out)
     cfg = load_configs()
     mcfg = cfg["metrics"]
-    mcfg["plausibility"]["pinn_epochs"] = 400 if not quick else 0
-    methods = ("lsq",) if quick else ("lsq", "pinn")
-    if quick:
-        mcfg["plausibility"]["method"] = "lsq"
+    # LSQ is the primary dynamical score here (fast, exact); the PINN is fitted on the oracle
+    # only, with fewer epochs than a real run, as a check that it reaches the same answer
+    mcfg["plausibility"]["method"] = "lsq"
+    mcfg["plausibility"]["pinn_epochs"] = 3000
     w, h = map(int, res.split("x"))
     data_dir = out / "data"
     if (data_dir / "manifest.json").exists():
@@ -66,11 +69,13 @@ def run_sanity(out: Path, res: str = "320x180", quick: bool = False) -> dict:
     floor = reference_floor(ds, tracker, mcfg, cal)
     print("[sanity] tracker floor (reference renders): " + ", ".join(f"{g} {v['S_rob']:.3f}" for g, v in floor.items()))
     summaries = {}
+    gens = {}
     for n in names:
         tracks = collect_tracks(ds, run_dir, n, tracker, mcfg, models[n].get("align", {}), log=lambda *a: None)
-        g, grp, s = score_tracks(ds, tracks, cal, mcfg, methods=methods)
+        methods = ("lsq", "pinn") if (n == "mock-oracle" and not quick) else ("lsq",)
+        g, grp, s = score_tracks(ds, tracks, cal, mcfg, methods=methods, workers=workers, log=lambda *a: None)
         write_scores(run_dir / n / "scores", g, grp, s, {"model": n})
-        summaries[n] = s
+        summaries[n], gens[n] = s, g
         if n in ("mock-oracle", "mock-timewarp-blue"):
             plot_tracks(ds, tracks, n, run_dir / "report" / "plots")
         print(f"[sanity] scored {n}")
@@ -108,7 +113,13 @@ def run_sanity(out: Path, res: str = "320x180", quick: bool = False) -> dict:
         "timewarp blue: angle group unaffected (>= 0.9)": G("mock-timewarp-blue", "thrown/angle", "S_rob") >= 0.9,
         "baseline physics_from_input: reference similarity >= 0.6": mean_over("baseline:physics_from_input", "S_ref") >= 0.6,
         "baseline freeze: plausibility = 0": mean_over("baseline:freeze", "S_plaus") == 0.0,
+        "static camera: no generation flagged as camera moved": all(
+            summaries[n]["flags"]["camera_moved"] == 0 for n in names),
     }
+    if not quick:
+        og = gens["mock-oracle"]
+        checks["oracle: PINN and LSQ dynamical scores agree (mean |difference| <= 0.03)"] = bool(
+            (og["S_dyn_pinn"] - og["S_dyn_lsq"]).abs().mean() <= 0.03)
     if "mock-oracle-api-quirks" in summaries:
         checks["oracle with API quirks: robustness within 0.15 of the tracker floor"] = all(
             abs(G("mock-oracle-api-quirks", g, "S_rob") - floor[g]["S_rob"]) <= 0.15 for g in gids)

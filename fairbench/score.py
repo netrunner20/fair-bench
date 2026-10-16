@@ -11,6 +11,7 @@ Outputs per scored model (``<run>/<model>/scores/``):
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -91,16 +92,12 @@ def track_video(ds: Dataset, clip: Clip, video: Path, tracker, mcfg: dict, align
     cm = camera_motion(av.frames, exclude_uv=(res.centers if np.isfinite(res.centers[0]).all() else None),
                        exclude_radius=r0 / (0.5 * (sx + sy)))
     thr = float(mcfg.get("camera_motion_px", 2.0))
-    lk, pc = cm.get("lk_max_median_disp_px"), cm.get("phasecorr_max_disp_px")
-    native_to_ref = 0.5 * (sx + sy)
-    if lk is not None:
-        moved = lk * native_to_ref > thr
-    elif pc is not None:  # textureless scene (few corners): fall back on phase correlation
-        moved = pc * native_to_ref > thr
-    else:
-        moved = False
+    disp = cm.get("max_median_disp_px")
+    # None = too little background texture to tell; reported as unknown, not as "still"
+    cam_px = None if disp is None else float(disp) * 0.5 * (sx + sy)
     info = {"source": str(video), "tracker": res.info.get("tracker"), "align": av.info,
-            "jumps_removed": n_jumps, "camera_motion": cm, "camera_moved": bool(moved)}
+            "jumps_removed": n_jumps, "camera_motion": cm, "camera_motion_px": cam_px,
+            "camera_moved": bool(cam_px is not None and cam_px > thr)}
     return TrackRecord(clip.id, -1, uv_eval, np.nan_to_num(ncomp, nan=0.0), info)
 
 
@@ -193,15 +190,39 @@ def _combine_plaus(S_dyn: float, S_inv: float, how: str) -> float:
     return 0.5 * (S_dyn + S_inv)
 
 
+def _plausibility_job(args: tuple) -> dict:
+    try:  # one thread per worker: the PINN's tensors are tiny, threads only add overhead
+        import torch
+
+        torch.set_num_threads(1)
+    except ImportError:
+        pass
+    *pos, methods = args
+    return plausibility(*pos, methods=methods)
+
+
+def _run_plausibility(jobs: list[tuple], workers: int) -> list[dict]:
+    """Plausibility of every generation; the PINN dominates, so spread it over processes."""
+    if workers > 1 and len(jobs) > 1:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(min(workers, len(jobs)), mp_context=mp.get_context("spawn")) as ex:
+            return list(ex.map(_plausibility_job, jobs, chunksize=1))
+    return [_plausibility_job(j) for j in jobs]
+
+
 def score_tracks(ds: Dataset, tracks: dict[str, list[TrackRecord]], cal: dict, mcfg: dict,
-                 methods: tuple[str, ...] = ("lsq", "pinn"), log=print) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+                 methods: tuple[str, ...] = ("lsq", "pinn"), log=print,
+                 workers: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     ev = np.arange(ds.n_gen + 1) >= 1
     full = float(mcfg.get("visible_full", 0.99))
     k_med = int(mcfg.get("median_k", 5))
     policy = mcfg.get("missing_policy", "penalty")
     pcfg = _plaus_cfg(mcfg)
     combine = (mcfg.get("plausibility") or {}).get("combine", "mean")
-    gen_rows = []
+    workers = int(workers if workers is not None else mcfg.get("workers", 1))
+    gen_rows, p_jobs = [], []
     for cid, recs in sorted(tracks.items()):
         c = ds.clips[cid]
         vis = ds.gt_visible(c, full)
@@ -215,6 +236,7 @@ def score_tracks(ds: Dataset, tracks: dict[str, list[TrackRecord]], cal: dict, m
         for rec in recs:
             row = {"clip": cid, "group": c.group, "variant": c.variant, "sample": rec.sample,
                    "camera_moved": rec.info.get("camera_moved", False),
+                   "camera_motion_px": rec.info.get("camera_motion_px", np.nan),
                    "short_output": rec.info.get("align", {}).get("short_output", False),
                    "aspect_ok": rec.info.get("align", {}).get("aspect_ok", True)}
             for mode in ("depth_scaled", "ray"):
@@ -225,12 +247,17 @@ def score_tracks(ds: Dataset, tracks: dict[str, list[TrackRecord]], cal: dict, m
             row["ref_final_err_m"] = r["final_err_m"]
             row["lost_frac"] = r["lost_frac"]
             row["S_ref"] = exp_score(r["err_m"], ccal["ceil_m"], ccal["ref_m"])
-            p = plausibility(rec.uv, c.camera, plane, ds.up, ds.g, ds.floor_contact_height(),
-                             MOTION_KIND.get(c.motion, "ballistic"), ds.eval_times(), ev, vis,
-                             rec.n_components, gt_extent, pcfg, methods=methods)
-            row.update({k: v for k, v in p.items() if not isinstance(v, dict)})
-            row["S_plaus"] = _combine_plaus(p["S_dyn"], p["S_inv"], combine)
+            p_jobs.append((rec.uv, c.camera, plane, ds.up, ds.g, ds.floor_contact_height(),
+                           MOTION_KIND.get(c.motion, "ballistic"), ds.eval_times(), ev, vis,
+                           rec.n_components, gt_extent, pcfg, tuple(methods)))
             gen_rows.append(row)
+    t0 = time.time()
+    # only the PINN is slow enough to be worth extra processes
+    for row, p in zip(gen_rows, _run_plausibility(p_jobs, workers if "pinn" in methods else 1)):
+        row.update({k: v for k, v in p.items() if not isinstance(v, dict)})
+        row["S_plaus"] = _combine_plaus(p["S_dyn"], p["S_inv"], combine)
+    if "pinn" in methods and p_jobs:
+        log(f"  plausibility of {len(p_jobs)} generation(s): {time.time() - t0:.0f} s ({workers} worker(s))")
     gen = pd.DataFrame(gen_rows)
 
     group_rows = []
@@ -285,6 +312,7 @@ def score_tracks(ds: Dataset, tracks: dict[str, list[TrackRecord]], cal: dict, m
         summary["flags"] = {
             "n_generations": int(len(gen)),
             "camera_moved": int(gen["camera_moved"].sum()),
+            "camera_motion_unknown": int(pd.to_numeric(gen["camera_motion_px"], errors="coerce").isna().sum()),
             "short_output": int(gen["short_output"].sum()),
             "aspect_mismatch": int((~gen["aspect_ok"].astype(bool)).sum()),
             "discarded": {str(k): int(v) for k, v in gen["discard"].value_counts().items()},

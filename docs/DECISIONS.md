@@ -29,6 +29,7 @@
 | Group combination | mean / per-intervention mean / geometric / worst / median | all reported |
 | Final weights | equal / robustness-heavy / geometric / robustness x plausibility | all reported |
 | Lost ball | penalty / exclude | penalty = 10 one-frame lags |
+| Videos flagged "camera moved" (the check needs background texture; plain walls give "unknown") | report only / exclude / re-register the frames | report only (count per model in the report) |
 | Dynamical score | PINN (Morpheus) / exact least squares | PINN, both reported |
 | Plausibility combination | mean / dynamical only / product | mean |
 | Sub-pixel refinement of SAM 2.1 masks | match the method used for the VIMS validation | probability-weighted centroid |

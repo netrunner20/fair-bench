@@ -238,11 +238,11 @@ def write_report(summaries: dict[str, dict], out_dir: Path, baselines: tuple[str
         lines += ["Needs at least 3 non-baseline models.", ""]
     flags = {m: s.get("flags", {}) for m, s in summaries.items() if s.get("flags")}
     if flags:
-        lines += ["## Flags", "", "| model | generations | camera moved | short output | aspect mismatch | mean lost frac |",
+        lines += ["## Flags", "", "| model | generations | camera moved (unknown) | short output | aspect mismatch | mean lost frac |",
                   "|---|---|---|---|---|---|"]
         for m, f in flags.items():
-            lines.append(f"| {m} | {f.get('n_generations')} | {f.get('camera_moved')} | {f.get('short_output')} | "
-                         f"{f.get('aspect_mismatch')} | {_fmt(f.get('mean_lost_frac'), 3)} |")
+            lines.append(f"| {m} | {f.get('n_generations')} | {f.get('camera_moved')} ({f.get('camera_motion_unknown', 0)}) | "
+                         f"{f.get('short_output')} | {f.get('aspect_mismatch')} | {_fmt(f.get('mean_lost_frac'), 3)} |")
         lines.append("")
     p = out_dir / "report.md"
     p.write_text("\n".join(lines))

@@ -9,10 +9,20 @@ visible are not compared.
 ## Shared measurement
 
 **Alignment.** Each output is mapped to the benchmark clock by timestamp (never by frame
-index) and to reference pixels by scale. Replayed input is detected automatically
-(output frame 0 matches input frame 0). A continuation that starts with a copy of the
-last input frame must be declared per model (`align.repeats_last_input`), because a
-lagging or frozen model produces the same thing.
+index) and to reference pixels by scale; tracks are resampled onto the 24 fps grid by
+linear interpolation in time. Replayed input is detected automatically (the first ~0.5 s
+of output match the input's frame sequence, from its first frame or, for APIs that keep
+only the end of the input, from a later one); the replay fixes the output's clock and is
+then dropped. Frame 0 of every aligned video is the last conditioning frame itself, where
+the ground truth is exact, and the tracker is initialised there. A continuation that
+starts with a copy of the last input frame must be declared per model
+(`align.repeats_last_input`), because a lagging or frozen model produces the same thing.
+
+**Camera-motion flag.** Background corners are tracked from frame 0 (Lucas-Kanade,
+forward-backward checked, ball masked) and a similarity motion is fitted with RANSAC; a
+video is flagged when the median image point moves more than 2 px. Without enough
+textured background (plain walls) the check reports "unknown" instead of guessing. The
+flag is reported, not used in any score.
 
 **Sphere-center correction.** A sphere of radius $r$ whose center has camera coordinates
 $(X, Y, Z)$ projects to an ellipse, not a circle centered on the projected center. Let
@@ -76,7 +86,11 @@ Reference: Tragoudaras et al., arXiv 2504.02918, code github.com/physics-from-vi
 3. **Dynamical score.** $S_{\mathrm{dyn}} = \max(1 - \mathrm{NMSE}, 0)$,
    $\mathrm{NMSE} = \sum_t \lVert y_t - \hat y_t\rVert^2 / \sum_t \lVert y_t - \bar y\rVert^2$.
    `pinn`: per segment a 1-20-20-2 tanh MLP, Adam (lr $10^{-3}$), loss = data MSE +
-   $\lambda \times$ physics residual ($\lambda = 1$), early stopping (Morpheus' setup).
+   $\lambda \times$ physics residual ($\lambda = 1$), up to 20000 epochs with early stopping
+   (patience 1000) (Morpheus' setup). The segments of one video are trained as one batch of
+   independent networks (identical updates, ~1/S of the time for S segments). Fewer
+   epochs underfit multi-bounce tracks (S_dyn ≈ 0.4 at 400 epochs on the true bounce
+   trajectory, 0.99 at 2000, 1.00 at 20000).
    `lsq`: the same equations imposed exactly (closed-form least squares, no $\lambda$).
 4. **Physical invariance score.** Velocities as in Morpheus (0.7 x local linear
    regression + 0.3 x central difference, then Savitzky-Golay, order 3, window 5).

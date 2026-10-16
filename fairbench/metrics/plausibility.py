@@ -187,69 +187,113 @@ def _lsq_segment(t: np.ndarray, s: np.ndarray, h: np.ndarray, kind: str, g: floa
 
 
 # -------------------------------------------------------------------- dynamical: PINN
-def _pinn_segment(t, s, h, kind, g, cfg: PlausibilityConfig):
+def _pinn_segments(segs: list[tuple[np.ndarray, np.ndarray, np.ndarray, str]], g: float,
+                   cfg: PlausibilityConfig) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Morpheus-style PINN fit of every segment of one track (soft physics constraint).
+
+    Each segment has its own network (1 -> H -> H -> 2, tanh), its own Adam state and its
+    own early stopping, exactly as if it were trained alone; the networks are only batched
+    into one set of tensors so that a track with ten segments costs about one training run.
+    (Adam is element-wise and the loss is a sum over segments, so the per-segment updates
+    are unchanged.) Inputs per segment: (t, s, h, kind) with kind "flight" or "roll".
+    """
     import torch
 
-    torch.manual_seed(cfg.seed)
-    dev = "cpu"
-    t0 = float(t.min())
-    T = max(float(t.max() - t0), 1e-3)
-    s0, h0 = float(np.mean(s)), float(np.mean(h))
-    td = torch.tensor((t - t0)[:, None], dtype=torch.float32, device=dev)
-    yd = torch.tensor(np.stack([s - s0, h - h0], 1), dtype=torch.float32, device=dev)
-    tp = torch.linspace(0.0, T, cfg.pinn_phys_points, device=dev)[:, None]
-    net = torch.nn.Sequential(
-        torch.nn.Linear(1, cfg.pinn_hidden), torch.nn.Tanh(),
-        torch.nn.Linear(cfg.pinn_hidden, cfg.pinn_hidden), torch.nn.Tanh(),
-        torch.nn.Linear(cfg.pinn_hidden, 2),
-    ).to(dev)
-    a_roll = torch.nn.Parameter(torch.zeros(1, device=dev))  # learnable along-track acceleration (Morpheus slide)
-    params = list(net.parameters()) + ([a_roll] if kind == "roll" else [])
-    opt = torch.optim.Adam(params, lr=cfg.pinn_lr)
-    best, bad = float("inf"), 0
+    S, H, P = len(segs), cfg.pinn_hidden, cfg.pinn_phys_points
+    torch.manual_seed(cfg.seed)  # every segment starts from the same initial network
+    proto = torch.nn.Sequential(torch.nn.Linear(1, H), torch.nn.Tanh(), torch.nn.Linear(H, H), torch.nn.Tanh(),
+                                torch.nn.Linear(H, 2))
+    rep = lambda w: torch.nn.Parameter(w.detach().clone().unsqueeze(0).repeat(S, *([1] * w.dim())))
+    W1, b1 = rep(proto[0].weight.T), rep(proto[0].bias)  # (S,1,H), (S,H)
+    W2, b2 = rep(proto[2].weight.T), rep(proto[2].bias)  # (S,H,H), (S,H)
+    W3, b3 = rep(proto[4].weight.T), rep(proto[4].bias)  # (S,H,2), (S,2)
+    a_roll = torch.nn.Parameter(torch.zeros(S, 1, 1))  # learnable along-track acceleration (Morpheus slide)
+
+    def net(x):  # x: (S, n, 1)
+        z = torch.tanh(torch.bmm(x, W1) + b1[:, None])
+        z = torch.tanh(torch.bmm(z, W2) + b2[:, None])
+        return torch.bmm(z, W3) + b3[:, None]
+
+    n_max = max(len(t) for t, *_ in segs)
+    td = torch.zeros(S, n_max, 1)
+    yd = torch.zeros(S, n_max, 2)
+    md = torch.zeros(S, n_max, 1)
+    tp = torch.zeros(S, P, 1)
+    roll = torch.zeros(S, 1, 1, dtype=torch.bool)
+    offs = []
+    for i, (t, s, h, kind) in enumerate(segs):
+        t0 = float(t.min())
+        T = max(float(t.max() - t0), 1e-3)
+        s0, h0 = float(np.mean(s)), float(np.mean(h))
+        offs.append((s0, h0))
+        n = len(t)
+        td[i, :n, 0] = torch.tensor(t - t0, dtype=torch.float32)
+        yd[i, :n] = torch.tensor(np.stack([s - s0, h - h0], 1), dtype=torch.float32)
+        md[i, :n] = 1.0
+        tp[i, :, 0] = torch.linspace(0.0, T, P)
+        roll[i] = kind == "roll"
+    n_i = md.sum(dim=(1, 2))  # points per segment
+    opt = torch.optim.Adam([W1, b1, W2, b2, W3, b3, a_roll], lr=cfg.pinn_lr)
+    best = torch.full((S,), float("inf"), dtype=torch.float64)
+    bad = torch.zeros(S, dtype=torch.long)
+    done = torch.zeros(S, dtype=torch.bool)
+    preds: list = [None] * S
     for _ in range(cfg.pinn_epochs):
         opt.zero_grad()
         tq = tp.clone().requires_grad_(True)
         y = net(tq)
-        ys, yh = y[:, :1], y[:, 1:]
+        ys, yh = y[..., :1], y[..., 1:]
         ds = torch.autograd.grad(ys, tq, torch.ones_like(ys), create_graph=True)[0]
         dh = torch.autograd.grad(yh, tq, torch.ones_like(yh), create_graph=True)[0]
         dds = torch.autograd.grad(ds, tq, torch.ones_like(ds), create_graph=True)[0]
         ddh = torch.autograd.grad(dh, tq, torch.ones_like(dh), create_graph=True)[0]
-        if kind == "flight":
-            phys = torch.mean(dds**2 + (ddh + g) ** 2)
-        else:
-            phys = torch.mean((dds - a_roll) ** 2 + ddh**2)
-        data = torch.mean((net(td) - yd) ** 2)
-        loss = data + cfg.pinn_lambda * phys
-        loss.backward()
+        res = torch.where(roll, (dds - a_roll) ** 2 + ddh**2, dds**2 + (ddh + g) ** 2)
+        phys = res.mean(dim=(1, 2))
+        data = (((net(td) - yd) ** 2) * md).sum(dim=(1, 2)) / (2.0 * n_i)
+        loss = data + cfg.pinn_lambda * phys  # (S,)
+        loss.sum().backward()
         opt.step()
-        lv = float(loss.item())
-        if lv < best - 1e-9:
-            best, bad = lv, 0
-        else:
-            bad += 1
-            if bad >= cfg.pinn_patience:
+        lv = loss.detach().double()
+        improved = lv < best - 1e-9
+        best = torch.where(improved, lv, best)
+        bad = torch.where(improved, torch.zeros_like(bad), bad + 1)
+        stop = (~done) & (bad >= cfg.pinn_patience)
+        if stop.any():
+            with torch.no_grad():
+                out = net(td)
+            for i in torch.nonzero(stop).ravel().tolist():
+                preds[i] = out[i].numpy().copy()
+            done |= stop
+            if bool(done.all()):
                 break
-    with torch.no_grad():
-        pred = net(td).cpu().numpy()
-    return pred[:, 0] + s0, pred[:, 1] + h0
+    if not bool(done.all()):
+        with torch.no_grad():
+            out = net(td)
+        for i in range(S):
+            if preds[i] is None:
+                preds[i] = out[i].numpy().copy()
+    result = []
+    for (t, *_), (s0, h0), p in zip(segs, offs, preds):
+        n = len(t)
+        result.append((p[:n, 0] + s0, p[:n, 1] + h0))
+    return result
 
 
 def dynamical_score(t, s, h, segments: list[Segment], g: float, method: str, cfg: PlausibilityConfig) -> dict:
-    res, tot, used = [], [], []
+    if method not in ("lsq", "pinn"):
+        raise ValueError(f"unknown dynamical-score method {method!r}")
+    data = []
     for seg in segments:
         sl = slice(seg.start, seg.stop)
         ok = np.isfinite(s[sl]) & np.isfinite(h[sl])
-        if ok.sum() < 3:
-            continue
-        ts, ss, hh = t[sl][ok], s[sl][ok], h[sl][ok]
-        if method == "lsq":
-            ps, ph = _lsq_segment(ts, ss, hh, seg.kind, g)
-        elif method == "pinn":
-            ps, ph = _pinn_segment(ts, ss, hh, seg.kind, g, cfg)
-        else:
-            raise ValueError(f"unknown dynamical-score method {method!r}")
+        if ok.sum() >= 3:
+            data.append((t[sl][ok], s[sl][ok], h[sl][ok], seg.kind))
+    if method == "lsq":
+        fits = [_lsq_segment(ts, ss, hh, kind, g) for ts, ss, hh, kind in data]
+    else:
+        fits = _pinn_segments(data, g, cfg) if data else []
+    res, used = [], []
+    for (ts, ss, hh, _), (ps, ph) in zip(data, fits):
         res.append(np.stack([ss - ps, hh - ph], 1))
         used.append(np.stack([ss, hh], 1))
     if not res:
